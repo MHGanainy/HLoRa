@@ -1,0 +1,14 @@
+# Core dependencies
+torch
+huggingface_hub
+evaluate
+datasets
+bitsandbytes
+trl
+scikit-learn>=0.24.1
+protobuf
+tqdm
+numpy
+nltk>=3.5
+scipy>=1.6.3
+seqeval
