@@ -131,8 +131,12 @@ class LoraLayer(BaseTunerLayer):
 
         # Actual trainable parameters
         for i in range(12):
-            self.lora_A[f"L_{i}"] = nn.Linear(self.in_features, r, bias=False)
-            self.lora_B[f"L_{i}"] = nn.Linear(r, self.out_features, bias=lora_bias)
+            if i not in [7,8,9,10,11]:
+                self.lora_A[f"L_{i}"] = nn.Linear(self.in_features, r, bias=False)
+                self.lora_B[f"L_{i}"] = nn.Linear(r, self.in_features, bias=lora_bias)
+            else:
+                self.lora_A[f"L_{i}"] = nn.Linear(self.in_features, r, bias=False)
+                self.lora_B[f"L_{i}"] = nn.Linear(r, self.out_features, bias=lora_bias)
 
         if use_rslora:
             self.scaling[adapter_name] = lora_alpha / math.sqrt(r)
@@ -672,75 +676,107 @@ class Linear(nn.Module, LoraLayer):
 
         return output_tensor
 
-    def forward(self, x: torch.Tensor,task_types=None, *args: Any, **kwargs: Any) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        task_types: torch.Tensor = None,
+        *args: Any,
+        **kwargs: Any
+    ) -> torch.Tensor:
+        """
+        Forward pass that handles a batch of inputs where each sample in the batch 
+        can have a different `task_type`.
+        """
+
         if task_types is None:
-            raise ValueError('task_types must be provided to the forward method')
-        
+            raise ValueError("task_types must be provided to the forward method")
+
+        if x.shape[0] != task_types.shape[0]:
+            raise ValueError(
+                f"Got x.shape[0] = {x.shape[0]} but task_types.shape[0] = {task_types.shape[0]}. "
+                "They must match in the batch dimension."
+            )
+
         self._check_forward_args(x, *args, **kwargs)
         adapter_names = kwargs.pop("adapter_names", None)
-        
-        active_adapter_hlora = []
 
-        if task_types[0] == 0: # UK
-            active_adapter_hlora = ["L_0","L_2","L_6","L_10"]
-        elif task_types[0] == 1: # EU
-            active_adapter_hlora = ["L_0","L_1","L_3","L_7"]
-        elif task_types[0] == 2: # Indian
-            active_adapter_hlora = ["L_0","L_1","L_4","L_8"]
-        elif task_types[0] == 3: # ECTHR
-            active_adapter_hlora = ["L_0","L_2","L_5","L_9"]
-        elif task_types[0] == 4: # Canadian
-            active_adapter_hlora = ["L_0","L_2","L_6","L_11"]
-        else:
-            raise ValueError(f"Unknown task_types[0] = {task_types[0]}")
-
+        # If adapters are disabled or merged, just do the usual fallback
         if self.disable_adapters:
             if self.merged:
                 self.unmerge()
-            result = self.base_layer(x, *args, **kwargs)
-        elif adapter_names is not None:
-            result = self._mixed_batch_forward(x, *args, adapter_names=adapter_names, **kwargs)
-        elif self.merged:
-            result = self.base_layer(x, *args, **kwargs)
-        else:
-            result = self.base_layer(x, *args, **kwargs)
-            torch_result_dtype = result.dtype
+            return self.base_layer(x, *args, **kwargs)
+
+        # If a mixed adapter usage is passed in, handle that (unchanged from your code)
+        if adapter_names is not None:
+            return self._mixed_batch_forward(x, *args, adapter_names=adapter_names, **kwargs)
+
+        # If merged, fallback as well
+        if self.merged:
+            return self.base_layer(x, *args, **kwargs)
+
+        # -- 1) Compute the base output for the entire batch at once
+        base_out = self.base_layer(x, *args, **kwargs)
+        torch_result_dtype = base_out.dtype
+
+        # We'll store the final result here
+        result = base_out.clone()
+
+        # ------------------------------------------------------------------------
+        # Helper function that returns the sub-layers for a single task_type
+        # ------------------------------------------------------------------------
+        def get_active_adapter_hlora(task_type: int):
+            if task_type == 0:
+                return ["L_0", "L_2", "L_6", "L_10"]
+            elif task_type == 1:
+                return ["L_0", "L_1", "L_3", "L_7"]
+            elif task_type == 2:
+                return ["L_0", "L_1", "L_4", "L_8"]
+            elif task_type == 3:
+                return ["L_0", "L_2", "L_5", "L_9"]
+            elif task_type == 4:
+                return ["L_0", "L_2", "L_6", "L_11"]
+            else:
+                raise ValueError(f"Unknown task_type = {task_type}")
+
+        # ------------------------------------------------------------------------
+        # 2) For each item in the batch, apply the sub-layers that correspond
+        #    to its task_type, then add it to that item's base_out
+        # ------------------------------------------------------------------------
+        all_sub_keys = list(self.lora_A.keys())
+        batch_size = x.shape[0]
+
+        for i in range(batch_size):
+            task_type_i = int(task_types[i].item())  # e.g. 0,1,2,3,4,...
+            # Which sub-layers do we activate for THIS sample?
+            active_adapter_hlora = get_active_adapter_hlora(task_type_i)
+
+            # Start with the original input for the LoRA passes
+            # (not the base_out, since you want to replicate the "chained_lora = x" logic)
+            chained_lora = x[i : i + 1, :]  # shape [1, seq_len, hidden], for example
+
+            # For each adapter in self.active_adapters (if you only ever have one,
+            # you can simplify the loop)
             for active_adapter in self.active_adapters:
-                all_sub_keys = list(self.lora_A.keys())
+                scaling_val = self.scaling[active_adapter]
+
+                # Loop over all sub-keys (L_0..L_11), but only apply those in `active_adapter_hlora`
                 for sub_key in all_sub_keys:
+                    if sub_key not in active_adapter_hlora:
+                        continue
+
                     lora_A = self.lora_A[sub_key]
                     lora_B = self.lora_B[sub_key]
                     dropout = self.lora_dropout[sub_key]
-                    base_scale = self.scaling[active_adapter]
 
-                    if sub_key in active_adapter_hlora:
-                        scaling = base_scale
-                    else:
-                        scaling = 0.0
+                    # Apply the transforms in series
+                    chained_lora = chained_lora.to(lora_A.weight.dtype)
+                    chained_lora = lora_B(lora_A(dropout(chained_lora))) * scaling_val
 
-                    x = x.to(lora_A.weight.dtype)
+            # Add the LoRA output to that particular row in the final result
+            result[i : i + 1, :] += chained_lora
 
-                    if not self.use_dora[active_adapter]:
-                        result = result + lora_B(lora_A(dropout(x))) * scaling
-                    
-                    else:
-                        if isinstance(dropout, nn.Identity) or not self.training:
-                            base_result = result
-                        else:
-                            x = dropout(x)
-                            base_result = None
-
-                        result = result + self.lora_magnitude_vector[active_adapter](
-                            x,
-                            lora_A=lora_A,
-                            lora_B=lora_B,
-                            scaling=scaling,
-                            base_layer=self.get_base_layer(),
-                            base_result=base_result,
-                        )
-
-            result = result.to(torch_result_dtype)
-
+        # Convert back to the original dtype if needed
+        result = result.to(torch_result_dtype)
         return result
 
     def __repr__(self) -> str:

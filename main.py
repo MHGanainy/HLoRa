@@ -13,6 +13,9 @@ import multiprocessing
 import math
 import os
 from huggingface_hub import HfApi
+import pandas as pd
+import numpy as np
+from datasets import Dataset
 
 # 0. Set seeds for reproducibility
 def set_seed(seed):
@@ -30,7 +33,7 @@ seed = 42
 set_seed(seed)
 
 # 1. Initialize the tokenizer and model
-model_name = "gpt2"
+model_name = "gpt2-xl"
 
 # Load tokenizer
 tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -43,6 +46,55 @@ if tokenizer.pad_token is None:
 # Since you've modified the model classes in the transformers library,
 # we can load the model directly
 model = AutoModelForCausalLM.from_pretrained(model_name, attn_implementation="flash_attention_2")
+
+
+def sample_by_group_with_max(
+        hf_dataset,
+        group_col: str,
+        fraction: float = 0.01,
+        random_state: int = 42,
+        oversample: bool = False
+    ):
+        # Step 1: Convert to pandas
+        df = hf_dataset.to_pandas()
+
+        # Step 2: Group by group_col
+        grouped = df.groupby(group_col)
+
+        # Step 3: Find largest group size
+        max_group_size = grouped.size().max()
+
+        # Step 4: Determine how many rows to sample per group
+        sample_size = int(np.floor(max_group_size * fraction))
+        print(f"Fraction = {fraction}, Max group size = {max_group_size}, "
+            f"sampling {sample_size} rows from each group.")
+
+        # Step 5: Sample from each group
+        if oversample:
+            # Oversample if a group has fewer rows than sample_size
+            df_sampled = grouped.apply(
+                lambda x: x.sample(
+                    n=sample_size,
+                    random_state=random_state,
+                    replace=(len(x) < sample_size)  # Only oversample if needed
+                )
+            )
+        else:
+            # Downsample only if group is bigger than sample_size
+            df_sampled = grouped.apply(
+                lambda x: x.sample(
+                    n=min(sample_size, len(x)),
+                    random_state=random_state,
+                    replace=False
+                )
+            )
+
+        # groupby.apply creates a multi-index; reset to regular RangeIndex
+        df_sampled.reset_index(drop=True, inplace=True)
+
+        # Step 6: Convert back to Hugging Face Dataset
+        return Dataset.from_pandas(df_sampled)
+
 
 # 2. Load your dataset
 dataset = load_dataset('MHGanainy/multi_clustering', 'lex-former-8-clustered-instance-b-dataset-cluster')
@@ -113,10 +165,24 @@ def prepare_dataset(dataset_split, split="train"):
     return lm_dataset
 
 print("Preprocessing training data...")
-train_dataset = prepare_dataset(dataset["train"].select(range(0,100)), "train")
+sampled_train = sample_by_group_with_max(
+        dataset["train"],
+        group_col="dataset_name",
+        fraction=0.0001,       # e.g. 1% of the largest group
+        random_state=42,
+        oversample=False     # or True if you want to oversample smaller groups
+    )
+train_dataset = prepare_dataset(sampled_train, "train")
 
 print("Preprocessing validation data...")
-eval_dataset = prepare_dataset(dataset["validation"].select(range(0,100)), "validation")
+sampled_eval = sample_by_group_with_max(
+        dataset["validation"],
+        group_col="dataset_name",
+        fraction=0.0001,       # e.g. 1% of the largest group
+        random_state=42,
+        oversample=False     # or True if you want to oversample smaller groups
+    )
+eval_dataset = prepare_dataset(sampled_eval, "validation")
 
 # 4. Apply PEFT with LoRA configurations
 # Define LoRA configurations
