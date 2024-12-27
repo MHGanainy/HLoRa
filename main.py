@@ -165,24 +165,24 @@ def prepare_dataset(dataset_split, split="train"):
     return lm_dataset
 
 print("Preprocessing training data...")
-# sampled_train = sample_by_group_with_max(
-#         dataset["train"],
-#         group_col="dataset_name",
-#         fraction=0.0001,       # e.g. 1% of the largest group
-#         random_state=42,
-#         oversample=False     # or True if you want to oversample smaller groups
-#     )
-train_dataset = prepare_dataset(dataset["train"], "train")
+sampled_train = sample_by_group_with_max(
+        dataset["train"],
+        group_col="dataset_name",
+        fraction=0.01,       # e.g. 1% of the largest group
+        random_state=42,
+        oversample=False     # or True if you want to oversample smaller groups
+    )
+train_dataset = prepare_dataset(sampled_train, "train")
 
 print("Preprocessing validation data...")
-# sampled_eval = sample_by_group_with_max(
-#         dataset["validation"],
-#         group_col="dataset_name",
-#         fraction=0.0001,       # e.g. 1% of the largest group
-#         random_state=42,
-#         oversample=False     # or True if you want to oversample smaller groups
-#     )
-eval_dataset = prepare_dataset(dataset["validation"], "validation")
+sampled_eval = sample_by_group_with_max(
+        dataset["validation"],
+        group_col="dataset_name",
+        fraction=0.01,       # e.g. 1% of the largest group
+        random_state=42,
+        oversample=False     # or True if you want to oversample smaller groups
+    )
+eval_dataset = prepare_dataset(sampled_eval, "validation")
 
 # 4. Apply PEFT with LoRA configurations
 # Define LoRA configurations
