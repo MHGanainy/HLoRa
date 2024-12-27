@@ -12,3 +12,4 @@ numpy
 nltk>=3.5
 scipy>=1.6.3
 seqeval
+tokenizers==0.20

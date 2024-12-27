@@ -30,7 +30,7 @@ seed = 42
 set_seed(seed)
 
 # 1. Initialize the tokenizer and model
-model_name = "gpt2-xl"
+model_name = "gpt2"
 
 # Load tokenizer
 tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -51,11 +51,11 @@ block_size = 1024
 
 # Task types mapping
 dataset_name_to_task_types = {
-    'santoshtyss/uk_courts_cases': [0,0,0,1,1],
-    'santoshtyss/eu-court-cases': [0,1,1,2,3],
-    'santoshtyss/indian_courts_cases': [0,0,0,0,0],
-    'santoshtyss/ecthr_cases': [0,1,2,3,4],
-    'santoshtyss/canadian_court_cases': [0,0,0,1,2]
+    'santoshtyss/uk_courts_cases': [0],
+    'santoshtyss/eu-court-cases': [1],
+    'santoshtyss/indian_courts_cases': [2],
+    'santoshtyss/ecthr_cases': [3],
+    'santoshtyss/canadian_court_cases': [4]
 }
 
 # 3. Tokenize the dataset
@@ -113,90 +113,23 @@ def prepare_dataset(dataset_split, split="train"):
     return lm_dataset
 
 print("Preprocessing training data...")
-train_dataset = prepare_dataset(dataset["train"], "train")
+train_dataset = prepare_dataset(dataset["train"].select(range(0,100)), "train")
 
 print("Preprocessing validation data...")
-eval_dataset = prepare_dataset(dataset["validation"], "validation")
+eval_dataset = prepare_dataset(dataset["validation"].select(range(0,100)), "validation")
 
 # 4. Apply PEFT with LoRA configurations
 # Define LoRA configurations
-peft_config_layers_0_8 = LoraConfig(
+peft_config = LoraConfig(
     task_type=TaskType.CAUSAL_LM,
-    r=64,
-    lora_alpha=128,
+    r=5,
+    lora_alpha=10,
     target_modules=['c_attn', 'c_proj'],
     lora_dropout=0.1,
-    layers_to_transform=list(range(0, 9)),
-    layers_pattern="h",
-    num_adapters_per_layer=1,
-    layer_group=0,
-    adapter_labels=["EU,Indian,ECHR,UK,CAC"],
-    r_a=[64]
-)
-
-peft_config_layers_9_10 = LoraConfig(
-    task_type=TaskType.CAUSAL_LM,
-    r=32,
-    lora_alpha=64,
-    target_modules=['c_attn', 'c_proj'],
-    lora_dropout=0.1,
-    layers_to_transform=list(range(9, 11)),
-    layers_pattern="h",
-    num_adapters_per_layer=2,
-    layer_group=1,
-    adapter_labels=['Indian,UK,CAC','EU,ECHR'],
-    r_a=[43,21]
-)
-
-peft_config_layers_11 = LoraConfig(
-    task_type=TaskType.CAUSAL_LM,
-    r=16,
-    lora_alpha=32,
-    target_modules=['c_attn', 'c_proj'],
-    lora_dropout=0.1,
-    layers_to_transform=[11],
-    layers_pattern="h",
-    num_adapters_per_layer=3,
-    layer_group=2,
-    adapter_labels=['Indian,UK,CAC','EU','ECHR'],
-    r_a=[43,14,7]
-)
-
-peft_config_layers_12_18 = LoraConfig(
-    task_type=TaskType.CAUSAL_LM,
-    r=13,
-    lora_alpha=26,
-    target_modules=['c_attn', 'c_proj'],
-    lora_dropout=0.1,
-    layers_to_transform=list(range(12, 19)),
-    layers_pattern="h",
-    num_adapters_per_layer=4,
-    layer_group=3,
-    adapter_labels=['Indian','UK,CAC','EU','ECHR'],
-    r_a=[9,34,14,7]
-)
-
-peft_config_layers_19_47 = LoraConfig(
-    task_type=TaskType.CAUSAL_LM,
-    r=13,
-    lora_alpha=26,
-    target_modules=['c_attn', 'c_proj'],
-    lora_dropout=0.1,
-    layers_to_transform=list(range(19, 48)),
-    layers_pattern="h",
-    num_adapters_per_layer=5,
-    layer_group=4,
-    adapter_labels=['Indian','UK','CAC','EU','ECHR'],
-    r_a=[9,31,3,14,7]
 )
 
 # Apply PEFT to the model
-model = get_peft_model(model, peft_config_layers_0_8, adapter_name="layers_0_8")
-model.add_adapter("layers_9_10", peft_config_layers_9_10)
-model.add_adapter("layers_11", peft_config_layers_11)
-model.add_adapter("layers_12_18", peft_config_layers_12_18)
-model.add_adapter("layers_19_47", peft_config_layers_19_47)
-
+model = get_peft_model(model, peft_config)
 # Manually set requires_grad=True for all adapter parameters
 for name, param in model.named_parameters():
     if "lora_" in name:
@@ -214,7 +147,7 @@ with open('trainable_parameters.txt', 'w') as f:
             f.write(f"Parameter Name: {name}\n")
 
 # 5. Define training arguments
-batch_size: int = 4
+batch_size: int = 1
 num_train_epochs = 1
 steps_per_epoch = len(train_dataset) // batch_size
 total_steps = int(steps_per_epoch * num_train_epochs)
@@ -241,7 +174,7 @@ training_args = TrainingArguments(
     seed=seed,  # Set seed for TrainingArguments
     evaluation_strategy="no",
     dataloader_num_workers=8,
-    torch_compile=True,
+    # torch_compile=True,
     dataloader_persistent_workers=True,
 )
 
@@ -272,21 +205,21 @@ trainer.log_metrics("eval", metrics)
 
 # 8. Save the model, tokenizer, and training arguments
 # Set your Hugging Face token
-huggingface_token = "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"
+# huggingface_token = "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"
 
-# Define your output directory and repository name
-output_dir = "./gpt2-xl-peft-lora-trained"
-repo_name = "MHGanainy/gpt2-xl-peft-lora-progressive-adapter-layer-comp-vocab-overlap"
+# # Define your output directory and repository name
+# output_dir = "./gpt2-xl-peft-lora-trained"
+# repo_name = "MHGanainy/gpt2-xl-peft-lora-progressive-adapter-layer-comp-vocab-overlap"
 
-# 1. Manually create the repository if it does not exist
-api = HfApi()
-api.create_repo(repo_id=repo_name, token=huggingface_token, exist_ok=True)
+# # 1. Manually create the repository if it does not exist
+# api = HfApi()
+# api.create_repo(repo_id=repo_name, token=huggingface_token, exist_ok=True)
 
-# 2. Save the model, tokenizer, and training arguments
-trainer.model.save_pretrained(output_dir)
-tokenizer.save_pretrained(output_dir)
+# # 2. Save the model, tokenizer, and training arguments
+# trainer.model.save_pretrained(output_dir)
+# tokenizer.save_pretrained(output_dir)
 
-# 3. Push the model and tokenizer to the Hugging Face Hub
-trainer.model.push_to_hub(repo_name, use_auth_token=huggingface_token)
-tokenizer.push_to_hub(repo_name, use_auth_token=huggingface_token)
+# # 3. Push the model and tokenizer to the Hugging Face Hub
+# trainer.model.push_to_hub(repo_name, use_auth_token=huggingface_token)
+# tokenizer.push_to_hub(repo_name, use_auth_token=huggingface_token)
 

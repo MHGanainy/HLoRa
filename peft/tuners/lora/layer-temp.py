@@ -39,7 +39,10 @@ class LoraLayer(BaseTunerLayer):
     other_param_names = ("r", "lora_alpha", "scaling", "lora_dropout")
 
     def __init__(self, base_layer: nn.Module, ephemeral_gpu_offload: bool = False, **kwargs) -> None:
+        self.num_adapters_per_layer = kwargs.get('num_adapters_per_layer', 1)
+        self.layer_group = kwargs.get('layer_group', 1)
         self.base_layer = base_layer
+        self.r_a = kwargs.get('r_a', None)
         self.r = {}
         self.lora_alpha = {}
         self.scaling = {}
@@ -53,7 +56,6 @@ class LoraLayer(BaseTunerLayer):
         self._disable_adapters = False
         self.merged_adapters = []
         self.use_dora: dict[str, bool] = {}
-        self.lora_bias: dict[str, bool] = {}
         self.lora_magnitude_vector = torch.nn.ModuleDict()  # for DoRA
         self._caches: dict[str, Any] = {}
         self.ephemeral_gpu_offload: bool = ephemeral_gpu_offload
@@ -104,95 +106,84 @@ class LoraLayer(BaseTunerLayer):
         self.out_features = out_features
 
     def update_layer(
-        self,
-        adapter_name,
-        r,
-        lora_alpha,
-        lora_dropout,
-        init_lora_weights,
-        use_rslora,
-        use_dora: bool = False,
-        lora_bias: bool = False,
+        self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_rslora, use_dora: bool = False
     ):
-        # This code works for linear layers, override for other layer types
+        if not self.r_a:
+            raise ValueError("`r_a` (list of ranks) must be provided.")
+
+        if len(self.r_a) != self.num_adapters_per_layer:
+            raise ValueError("Length of `r_a` must match `num_adapters_per_layer`.")
+        # Check for positive rank
         if r <= 0:
             raise ValueError(f"`r` should be a positive integer value but the value passed is {r}")
 
-        self.r[adapter_name] = r
-        self.lora_alpha[adapter_name] = lora_alpha
-        self.lora_bias[adapter_name] = lora_bias
-        
-        for i in range(12):
+        self.r[adapter_name] = {}
+        self.lora_alpha[adapter_name] = {}  # Initialize as a dict
+        num_adapters = self.num_adapters_per_layer  # Get from kwargs or set explicitly
+
+        # Initialize lora_dropout if not already done
+        if adapter_name not in self.lora_dropout:
             if lora_dropout > 0.0:
-                lora_dropout_layer = nn.Dropout(p=lora_dropout)
+                self.lora_dropout[adapter_name] = nn.Dropout(p=lora_dropout)
             else:
-                lora_dropout_layer = nn.Identity()
-            self.lora_dropout.update(nn.ModuleDict({f"L_{i}": lora_dropout_layer}))
+                self.lora_dropout[adapter_name] = nn.Identity()
 
-        # Actual trainable parameters
-        for i in range(12):
-            self.lora_A[f"L_{i}"] = nn.Linear(self.in_features, r, bias=False)
-            self.lora_B[f"L_{i}"] = nn.Linear(r, self.out_features, bias=lora_bias)
+        # Create multiple adapters using ModuleDict indexed by adapter indices (as strings)
+        self.lora_A[adapter_name] = nn.ModuleDict()
+        self.lora_B[adapter_name] = nn.ModuleDict()
+        scaling = {}
 
-        if use_rslora:
-            self.scaling[adapter_name] = lora_alpha / math.sqrt(r)
-        else:
-            self.scaling[adapter_name] = lora_alpha / r
+        for idx, rank in enumerate(self.r_a):
+            adapter_idx_str = str(idx)
+            if rank <= 0:
+                raise ValueError(f"`r` should be a positive integer value but got {rank} for adapter index {idx}")
 
-        # for inits that require access to the base weight, use gather_param_ctx so that the weight is gathered when using DeepSpeed
-        if isinstance(init_lora_weights, str) and init_lora_weights.startswith("pissa"):
-            with gather_params_ctx(self.get_base_layer().weight):
-                self.pissa_init(adapter_name, init_lora_weights)
-        elif isinstance(init_lora_weights, str) and init_lora_weights.startswith("corda"):
-            with gather_params_ctx(self.get_base_layer().weight):
-                self.corda_init(adapter_name, init_lora_weights)
-        elif isinstance(init_lora_weights, str) and init_lora_weights.lower() == "olora":
-            with gather_params_ctx(self.get_base_layer().weight):
-                self.olora_init(adapter_name)
-        elif init_lora_weights == "loftq":
-            with gather_params_ctx(self.get_base_layer().weight):
-                self.loftq_init(adapter_name)
-        elif init_lora_weights == "eva":
-            nn.init.zeros_(self.lora_B[adapter_name].weight)
-        elif init_lora_weights:
-            self.reset_lora_parameters(adapter_name, init_lora_weights)
-        # call this before dora_init
+            # Set rank per adapter index
+            self.r[adapter_name][adapter_idx_str] = rank
+            # Set lora_alpha per adapter index
+            lora_alpha = 2 * rank
+            self.lora_alpha[adapter_name][adapter_idx_str] = lora_alpha
+
+            self.lora_A[adapter_name][adapter_idx_str] = nn.Linear(self.in_features, rank, bias=False)
+            self.lora_B[adapter_name][adapter_idx_str] = nn.Linear(rank, self.out_features, bias=False)
+
+            # Set scaling for each adapter
+            if use_rslora:
+                scaling[adapter_idx_str] = lora_alpha / math.sqrt(rank)
+            else:
+                scaling[adapter_idx_str] = lora_alpha / rank
+
+        self.scaling[adapter_name] = scaling
+
+        # Initialize adapter weights using reset_lora_parameters
+        self.reset_lora_parameters(adapter_name, init_lora_weights)
+
+        # Move adapters to the same device as the base layer
         self._move_adapter_to_device_of_base_layer(adapter_name)
 
-        if use_dora:
-            self.dora_init(adapter_name)
-            self.use_dora[adapter_name] = True
-        else:
-            self.use_dora[adapter_name] = False
-
+        # Set the active adapters (assuming you have this method implemented)
         self.set_adapter(self.active_adapters)
 
     def reset_lora_parameters(self, adapter_name, init_lora_weights):
         if init_lora_weights is False:
             return
 
-        if all(k.startswith("L_") for k in self.lora_A.keys()):
-            for sub_key, sub_layer_A in self.lora_A.items():
-                if init_lora_weights is True:
-                    nn.init.kaiming_uniform_(sub_layer_A.weight, a=math.sqrt(5))
-                elif init_lora_weights.lower() == "gaussian":
-                    nn.init.normal_(sub_layer_A.weight, std=1 / self.r[adapter_name])
-                else:
-                    raise ValueError(f"Unknown initialization {init_lora_weights=}")
+        if adapter_name in self.lora_A.keys():
+            for adapter_idx_str in self.lora_A[adapter_name].keys():
+                rank = self.r[adapter_name][adapter_idx_str]
+                lora_alpha = self.lora_alpha[adapter_name][adapter_idx_str]
+                lora_A_weight = self.lora_A[adapter_name][adapter_idx_str].weight
+                lora_B_weight = self.lora_B[adapter_name][adapter_idx_str].weight
 
-            # Similarly for the matching B sub-layers
-            for sub_key, sub_layer_B in self.lora_B.items():
-                nn.init.zeros_(sub_layer_B.weight)
-                if self.lora_bias[adapter_name]:
-                    nn.init.zeros_(sub_layer_B.bias)
-        if adapter_name in self.lora_embedding_A.keys():
-            # Initialize A to zeros and B the same way as the default for nn.Embedding, see:
-            # https://github.com/microsoft/LoRA/blob/4c0333854cb905966f8cc4e9a74068c1e507c7b7/loralib/layers.py#L59-L60
-            nn.init.zeros_(self.lora_embedding_A[adapter_name])
-            nn.init.normal_(self.lora_embedding_B[adapter_name])
-            if self.lora_bias[adapter_name]:
-                # embeddings are not supported at the moment, but still adding this for consistency
-                nn.init.zeros_(self.lora_embedding_B[adapter_name].bias)
+                if init_lora_weights is True:
+                    nn.init.kaiming_uniform_(lora_A_weight, a=math.sqrt(5))
+                    nn.init.zeros_(lora_B_weight)
+                elif init_lora_weights.lower() == "gaussian":
+                    nn.init.normal_(lora_A_weight, std=1 / rank)
+                    nn.init.zeros_(lora_B_weight)
+                else:
+                    raise ValueError(f"Unknown initialization method '{init_lora_weights}'")
+
 
     def olora_init(self, adapter_name):
         base_layer = self.get_base_layer()
@@ -272,77 +263,6 @@ class LoraLayer(BaseTunerLayer):
         self.lora_B[adapter_name].weight.data = lora_B
         weight = weight.data - self.scaling[adapter_name] * lora_B @ lora_A
         weight = transpose(weight.to(dtype), self.fan_in_fan_out)
-        self.get_base_layer().weight.data = weight
-
-    def corda_init(self, adapter_name, init_lora_weights):
-        linear = self.get_base_layer()
-        weight = linear.weight
-        dtype = weight.dtype
-        if dtype not in [torch.float32, torch.float16, torch.bfloat16]:
-            raise TypeError(
-                "Please initialize CorDA under float32, float16, or bfloat16. "
-                "Subsequently, re-quantize the residual model to help minimize quantization errors."
-            )
-        weight = weight.to(torch.float32)
-        out_dim = weight.data.size(0)
-        in_dim = weight.data.size(1)
-
-        # Calculate WC from covariance matrix
-        if not hasattr(linear, "eigens"):
-            raise ValueError(
-                "`eigens` attribute not found for layer, please run `preprocess_corda` first. "
-                "More information can be found at examples/corda_finetuning/README.md."
-            )
-        eigens = linear.eigens
-        U = eigens.U_WC
-        S = eigens.S_WC
-        V = eigens.V_WC
-        r = self.r[adapter_name]
-
-        # nan or inf check
-        if torch.isnan(S).any() or torch.isinf(S).any():
-            raise ValueError(
-                "Invalid value found in matrix S. Please file an issue at https://github.com/huggingface/peft/issues."
-            )
-        if torch.isnan(U).any() or torch.isinf(U).any():
-            raise ValueError(
-                "Invalid value found in matrix U. Please file an issue at https://github.com/huggingface/peft/issues."
-            )
-        if torch.isnan(V).any() or torch.isinf(V).any():
-            raise ValueError(
-                "Invalid value found in matrix V. Please file an issue at https://github.com/huggingface/peft/issues."
-            )
-
-        # Sanity check
-        if U.size(0) != out_dim or U.size(1) != r:
-            raise ValueError(
-                f"Matrix U size mismatch: {U.size()} vs. ({out_dim}, {r}). Please make sure the `lora_config` and "
-                "`model` argument of `preprocess_corda` is consistent with `get_peft_model`. If you're using cache "
-                "in `preprocess_corda`, please make sure the cache is built with the same model and LoRA rank."
-            )
-        if S.size(0) != r:
-            raise ValueError(
-                f"Matrix S size mismatch: {S.size()} vs. ({r},). Please make sure the `lora_config` and `model` argument "
-                "of `preprocess_corda` is consistent with `get_peft_model`. If you're using cache in `preprocess_corda`, "
-                "please make sure the cache is built with the same model and LoRA rank."
-            )
-        if V.size(0) != in_dim or V.size(1) != r:
-            raise ValueError(
-                f"Matrix V size mismatch: {V.size()} vs. ({in_dim}, {r}). Please make sure the `lora_config` and "
-                "`model` argument of `preprocess_corda` is consistent with `get_peft_model`. If you're using cache "
-                "in `preprocess_corda`, please make sure the cache is built with the same model and LoRA rank."
-            )
-
-        # Apply alpha
-        S /= self.scaling[adapter_name]
-
-        # Init lora_A and lora_B weights
-        lora_A = V.t().mul(S.sqrt().view(-1, 1)).contiguous()
-        lora_B = U.mul(S.sqrt()).contiguous()
-        self.lora_A[adapter_name].weight.data = lora_A
-        self.lora_B[adapter_name].weight.data = lora_B
-        weight = weight.data - self.scaling[adapter_name] * lora_B @ lora_A
-        weight = weight.to(dtype)
         self.get_base_layer().weight.data = weight
 
     def loftq_init(self, adapter_name):
@@ -508,7 +428,6 @@ class Linear(nn.Module, LoraLayer):
         init_lora_weights: Union[bool, str] = True,
         use_rslora: bool = False,
         use_dora: bool = False,
-        lora_bias: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -524,7 +443,6 @@ class Linear(nn.Module, LoraLayer):
             init_lora_weights=init_lora_weights,
             use_rslora=use_rslora,
             use_dora=use_dora,
-            lora_bias=lora_bias,
         )
         self.is_target_conv_1d_layer = is_target_conv_1d_layer
 
@@ -578,15 +496,6 @@ class Linear(nn.Module, LoraLayer):
                         )
 
                     base_layer.weight.data = orig_weights
-
-                    if self.lora_bias[active_adapter]:
-                        new_bias = base_layer.bias + self.lora_B[active_adapter].bias
-                        if not torch.isfinite(new_bias).all():
-                            raise ValueError(
-                                f"NaNs detected in the merged weights. The adapter {active_adapter} seems to be broken"
-                            )
-                        base_layer.bias.data = new_bias
-
                 else:
                     delta_weight = self.get_delta_weight(active_adapter)
                     if not self.use_dora[active_adapter]:
@@ -610,9 +519,6 @@ class Linear(nn.Module, LoraLayer):
                         new_weight = dora_factor * (base_layer.weight.data + delta_weight)
                         base_layer.weight.data = new_weight
 
-                    if self.lora_bias[active_adapter]:
-                        base_layer.bias.data += self.lora_B[active_adapter].bias
-
                 self.merged_adapters.append(active_adapter)
 
     def unmerge(self) -> None:
@@ -634,9 +540,6 @@ class Linear(nn.Module, LoraLayer):
                     dora_factor = self.lora_magnitude_vector[active_adapter].weight / weight_norm
                     weight_orig = weight.data / dora_factor.view(-1, 1) - delta_weight
                     weight.data = weight_orig
-
-                if self.lora_bias[active_adapter]:
-                    self.get_base_layer().bias.data -= self.lora_B[active_adapter].bias
 
     def get_delta_weight(self, adapter) -> torch.Tensor:
         """
@@ -672,74 +575,58 @@ class Linear(nn.Module, LoraLayer):
 
         return output_tensor
 
-    def forward(self, x: torch.Tensor,task_types=None, *args: Any, **kwargs: Any) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        task_types=None,
+        *args: Any,
+        **kwargs: Any
+    ) -> torch.Tensor:
         if task_types is None:
             raise ValueError('task_types must be provided to the forward method')
-        
-        self._check_forward_args(x, *args, **kwargs)
-        adapter_names = kwargs.pop("adapter_names", None)
-        
-        active_adapter_hlora = []
 
-        if task_types[0] == 0: # UK
-            active_adapter_hlora = ["L_0","L_2","L_6","L_10"]
-        elif task_types[0] == 1: # EU
-            active_adapter_hlora = ["L_0","L_1","L_3","L_7"]
-        elif task_types[0] == 2: # Indian
-            active_adapter_hlora = ["L_0","L_1","L_4","L_8"]
-        elif task_types[0] == 3: # ECTHR
-            active_adapter_hlora = ["L_0","L_2","L_5","L_9"]
-        elif task_types[0] == 4: # Canadian
-            active_adapter_hlora = ["L_0","L_2","L_6","L_11"]
+        if not hasattr(self, 'layer_group'):
+            raise ValueError('layer_group must be set for each Linear layer')
+
+        # Get the adapter indices for the current layer group
+        # task_types shape: (batch_size, num_layer_groups)
+        adapter_indices = task_types[:, self.layer_group]  # shape: (batch_size,)
+        # Determine the adapter name for the current layer group
+        if self.layer_group == 0:
+            adapter_name = 'layers_0_8'
+        elif self.layer_group == 1:
+            adapter_name = 'layers_9_10'
+        elif self.layer_group == 2:
+            adapter_name = 'layers_11'
+        elif self.layer_group == 3:
+            adapter_name = 'layers_12_18'
+        elif self.layer_group == 4:
+            adapter_name = 'layers_19_47'
         else:
-            raise ValueError(f"Unknown task_types[0] = {task_types[0]}")
+            raise ValueError(f"Invalid layer group: {self.layer_group}")
 
-        if self.disable_adapters:
-            if self.merged:
-                self.unmerge()
-            result = self.base_layer(x, *args, **kwargs)
-        elif adapter_names is not None:
-            result = self._mixed_batch_forward(x, *args, adapter_names=adapter_names, **kwargs)
-        elif self.merged:
-            result = self.base_layer(x, *args, **kwargs)
-        else:
-            result = self.base_layer(x, *args, **kwargs)
-            torch_result_dtype = result.dtype
-            for active_adapter in self.active_adapters:
-                all_sub_keys = list(self.lora_A.keys())
-                for sub_key in all_sub_keys:
-                    lora_A = self.lora_A[sub_key]
-                    lora_B = self.lora_B[sub_key]
-                    dropout = self.lora_dropout[sub_key]
-                    base_scale = self.scaling[active_adapter]
+        # Proceed with base computation
+        result = self.base_layer(x, *args, **kwargs)
+        torch_result_dtype = result.dtype
 
-                    if sub_key in active_adapter_hlora:
-                        scaling = base_scale
-                    else:
-                        scaling = 0.0
+        # Process each unique adapter index
+        unique_adapter_indices = torch.unique(adapter_indices)
+        for adapter_idx in unique_adapter_indices:
+            # Mask for samples that use this adapter
+            mask = (adapter_indices == adapter_idx)
+            sub_x = x[mask]
+            if sub_x.size(0) == 0:
+                continue
 
-                    x = x.to(lora_A.weight.dtype)
+            adapter_idx_str = str(adapter_idx.item())
+            lora_A = self.lora_A[adapter_name][adapter_idx_str]
+            lora_B = self.lora_B[adapter_name][adapter_idx_str]
+            dropout = self.lora_dropout[adapter_name]
+            scaling = self.scaling[adapter_name][adapter_idx_str]
+            sub_x = sub_x.to(lora_A.weight.dtype)
 
-                    if not self.use_dora[active_adapter]:
-                        result = result + lora_B(lora_A(dropout(x))) * scaling
-                    
-                    else:
-                        if isinstance(dropout, nn.Identity) or not self.training:
-                            base_result = result
-                        else:
-                            x = dropout(x)
-                            base_result = None
-
-                        result = result + self.lora_magnitude_vector[active_adapter](
-                            x,
-                            lora_A=lora_A,
-                            lora_B=lora_B,
-                            scaling=scaling,
-                            base_layer=self.get_base_layer(),
-                            base_result=base_result,
-                        )
-
-            result = result.to(torch_result_dtype)
+            lora_output = lora_B(lora_A(dropout(sub_x))) * scaling
+            result[mask] += lora_output.to(torch_result_dtype)
 
         return result
 
@@ -760,13 +647,8 @@ class Embedding(nn.Module, LoraLayer):
         init_lora_weights: Union[bool, str] = True,
         use_rslora: bool = False,
         use_dora: bool = False,
-        lora_bias: bool = False,
         **kwargs,
     ) -> None:
-        if lora_bias:
-            # lora_bias=True is not supported (yet) for embedding layers, as they use nn.Parameter
-            raise ValueError(f"lora_bias={lora_bias} is not supported for {self.__class__.__name__}.")
-
         super().__init__()
         LoraLayer.__init__(self, base_layer)
 
@@ -779,12 +661,9 @@ class Embedding(nn.Module, LoraLayer):
             init_lora_weights=init_lora_weights,
             use_rslora=use_rslora,
             use_dora=use_dora,
-            lora_bias=lora_bias,
         )
 
-    def update_layer(
-        self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_rslora, use_dora, lora_bias
-    ):
+    def update_layer(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_rslora, use_dora):
         if r <= 0:
             raise ValueError(f"`r` should be a positive integer value but the value passed is {r}")
 
@@ -801,8 +680,6 @@ class Embedding(nn.Module, LoraLayer):
         weight_B = torch.randn((self.out_features, r))
         self.lora_embedding_A[adapter_name] = nn.Parameter(weight_A)
         self.lora_embedding_B[adapter_name] = nn.Parameter(weight_B)
-        self.lora_bias[adapter_name] = lora_bias
-
         if use_rslora:
             self.scaling[adapter_name] = lora_alpha / math.sqrt(r)
         else:
@@ -1020,7 +897,6 @@ class _ConvNd(nn.Module, LoraLayer):
         init_lora_weights: Union[bool, str] = True,
         use_rslora: bool = False,
         use_dora: bool = False,
-        lora_bias: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -1037,12 +913,9 @@ class _ConvNd(nn.Module, LoraLayer):
             init_lora_weights=init_lora_weights,
             use_rslora=use_rslora,
             use_dora=use_dora,
-            lora_bias=lora_bias,
         )
 
-    def update_layer(
-        self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_rslora, use_dora, lora_bias
-    ):
+    def update_layer(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_rslora, use_dora):
         if r <= 0:
             raise ValueError(f"`r` should be a positive integer value but the value passed is {r}")
 
@@ -1062,9 +935,7 @@ class _ConvNd(nn.Module, LoraLayer):
         conv_layer = type(base_layer)
         out_kernel = out_stride = (1,) * (self._kernel_dim - 2)
         self.lora_A[adapter_name] = conv_layer(self.in_features, r, kernel_size, stride, padding, bias=False)
-        self.lora_B[adapter_name] = conv_layer(r, self.out_features, out_kernel, out_stride, bias=lora_bias)
-        self.lora_bias[adapter_name] = lora_bias
-
+        self.lora_B[adapter_name] = conv_layer(r, self.out_features, out_kernel, out_stride, bias=False)
         if use_rslora:
             self.scaling[adapter_name] = lora_alpha / math.sqrt(r)
         else:
@@ -1155,15 +1026,6 @@ class _ConvNd(nn.Module, LoraLayer):
                             f"NaNs detected in the merged weights. The adapter {active_adapter} seems to be broken"
                         )
                     base_layer.weight.data = orig_weights
-
-                    if self.lora_bias[active_adapter]:
-                        new_bias = base_layer.bias + self.lora_B[active_adapter].bias
-                        if not torch.isfinite(new_bias).all():
-                            raise ValueError(
-                                f"NaNs detected in the merged weights. The adapter {active_adapter} seems to be broken"
-                            )
-                        base_layer.bias.data = new_bias
-
                 else:
                     delta_weight = self.get_delta_weight(active_adapter)
                     if not self.use_dora[active_adapter]:
@@ -1186,9 +1048,6 @@ class _ConvNd(nn.Module, LoraLayer):
                         )
                         base_layer.weight.data = new_weight
 
-                    if self.lora_bias[active_adapter]:
-                        base_layer.bias.data += self.lora_B[active_adapter].bias
-
                 self.merged_adapters.append(active_adapter)
 
     def unmerge(self) -> None:
@@ -1210,9 +1069,6 @@ class _ConvNd(nn.Module, LoraLayer):
                     dora_factor = self.lora_magnitude_vector[active_adapter].weight / weight_norm
                     weight_orig = weight.data / dora_factor.view(*self._get_dora_factor_view()) - delta_weight
                     weight.data = weight_orig
-
-                if self.lora_bias[active_adapter]:
-                    self.get_base_layer().bias.data -= self.lora_B[active_adapter].bias
 
     def get_delta_weight(self, adapter) -> torch.Tensor:
         """
