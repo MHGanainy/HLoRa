@@ -46,6 +46,7 @@ class LoraLayer(BaseTunerLayer):
         self.lora_dropout = nn.ModuleDict({})
         self.lora_A = nn.ModuleDict({})
         self.lora_B = nn.ModuleDict({})
+        self.proj = nn.ModuleDict({})
         # For Embedding layer
         self.lora_embedding_A = nn.ParameterDict({})
         self.lora_embedding_B = nn.ParameterDict({})
@@ -131,12 +132,10 @@ class LoraLayer(BaseTunerLayer):
 
         # Actual trainable parameters
         for i in range(12):
-            if i not in [7,8,9,10,11]:
-                self.lora_A[f"L_{i}"] = nn.Linear(self.in_features, r, bias=False)
-                self.lora_B[f"L_{i}"] = nn.Linear(r, self.in_features, bias=lora_bias)
-            else:
-                self.lora_A[f"L_{i}"] = nn.Linear(self.in_features, r, bias=False)
-                self.lora_B[f"L_{i}"] = nn.Linear(r, self.out_features, bias=lora_bias)
+            self.lora_A[f"L_{i}"] = nn.Linear(self.in_features, r, bias=False)
+            self.lora_B[f"L_{i}"] = nn.Linear(r, self.out_features, bias=lora_bias)
+        for i in range(7):
+            self.proj[f"L_{i}"] = nn.Linear(self.out_features, self.in_features, bias=False)
 
         if use_rslora:
             self.scaling[adapter_name] = lora_alpha / math.sqrt(r)
@@ -679,105 +678,147 @@ class Linear(nn.Module, LoraLayer):
     def forward(
         self,
         x: torch.Tensor,
-        task_types: torch.Tensor = None,
+        task_types=None,
         *args: Any,
         **kwargs: Any
     ) -> torch.Tensor:
         """
-        Forward pass that handles a batch of inputs where each sample in the batch 
-        can have a different `task_type`.
+        Updated 'forward' method that:
+        1) Runs the base_layer(x).
+        2) Identifies the path of LoRA sub-keys for this task type.
+        3) Chains each active LoRA sub-key in *sequence*:
+            x -> L_0 -> L_2 -> L_6 -> L_10 (etc., depending on task type).
+        4) Adds the final LoRA output to base_out.
         """
 
+        # ------------------------------------------------------------------------
+        # 0) Preliminary checks, same as before
+        # ------------------------------------------------------------------------
         if task_types is None:
             raise ValueError("task_types must be provided to the forward method")
-
-        if x.shape[0] != task_types.shape[0]:
-            raise ValueError(
-                f"Got x.shape[0] = {x.shape[0]} but task_types.shape[0] = {task_types.shape[0]}. "
-                "They must match in the batch dimension."
-            )
 
         self._check_forward_args(x, *args, **kwargs)
         adapter_names = kwargs.pop("adapter_names", None)
 
-        # If adapters are disabled or merged, just do the usual fallback
+        # We still define tree_depth + get_depth_adapter, though we won't do
+        # a "sum per depth" anymore, just to keep minimal code changes.
+        tree_depth = 4
+
+        def get_depth_adapter(depth):
+            if depth == 0:
+                return ["L_0"]
+            elif depth == 1:
+                return ["L_1", "L_2"]
+            elif depth == 2:
+                return ["L_3", "L_4", "L_5", "L_6"]
+            elif depth == 3:
+                return ["L_7", "L_8", "L_9", "L_10", "L_11"]
+            else:
+                return []
+
+        # ------------------------------------------------------------------------
+        # 1) Determine which LoRA sub-keys are active for this task
+        # ------------------------------------------------------------------------
+        if task_types[0] == 0:   # UK
+            active_adapter_hlora = ["L_0", "L_2", "L_6", "L_10"]
+        elif task_types[0] == 1: # EU
+            active_adapter_hlora = ["L_0", "L_1", "L_3", "L_7"]
+        elif task_types[0] == 2: # Indian
+            active_adapter_hlora = ["L_0", "L_1", "L_4", "L_8"]
+        elif task_types[0] == 3: # ECTHR
+            active_adapter_hlora = ["L_0", "L_2", "L_5", "L_9"]
+        elif task_types[0] == 4: # Canadian
+            active_adapter_hlora = ["L_0", "L_2", "L_6", "L_11"]
+        else:
+            raise ValueError(f"Unknown task_types[0] = {task_types[0]}")
+
+        # ------------------------------------------------------------------------
+        # 2) Build a masks_per_depth list (unchanged), though we now won't sum
+        #    at each depth. We keep it in case other logic (merges, etc.) still
+        #    relies on it. Each mask is 1.0 if that sub-key is in the path.
+        # ------------------------------------------------------------------------
+        masks_per_depth = []
+        for depth in range(tree_depth):
+            sub_keys = get_depth_adapter(depth)
+            mask_dict = {}
+            for sub_key in sub_keys:
+                mask_dict[sub_key] = 1.0 if sub_key in active_adapter_hlora else 0.0
+            masks_per_depth.append(mask_dict)
+
+        # ------------------------------------------------------------------------
+        # 3) Standard checks: disable_adapters, merges, etc.
+        # ------------------------------------------------------------------------
         if self.disable_adapters:
             if self.merged:
                 self.unmerge()
             return self.base_layer(x, *args, **kwargs)
 
-        # If a mixed adapter usage is passed in, handle that (unchanged from your code)
         if adapter_names is not None:
             return self._mixed_batch_forward(x, *args, adapter_names=adapter_names, **kwargs)
 
-        # If merged, fallback as well
         if self.merged:
             return self.base_layer(x, *args, **kwargs)
 
-        # -- 1) Compute the base output for the entire batch at once
+        # ------------------------------------------------------------------------
+        # 4) Base forward pass (same as before)
+        # ------------------------------------------------------------------------
         base_out = self.base_layer(x, *args, **kwargs)
-        torch_result_dtype = base_out.dtype
-
-        # We'll store the final result here
-        result = base_out.clone()
+        orig_dtype = base_out.dtype
 
         # ------------------------------------------------------------------------
-        # Helper function that returns the sub-layers for a single task_type
+        # 5) New: Sequentially apply each active LoRA sub-key from the path
+        #
+        #    If e.g. active_adapter_hlora = ["L_0", "L_2", "L_6", "L_10"],
+        #    we do:
+        #       out_0 = proj_0( lora_B_0( lora_A_0( x ) ) )
+        #       out_2 = proj_2( lora_B_2( lora_A_2( out_0 ) ) )
+        #       out_6 = ...
+        #       out_10 = ...
+        #    final_lora_out = out_10
+        #
+        #    Then final_out = base_out + final_lora_out.
         # ------------------------------------------------------------------------
-        def get_active_adapter_hlora(task_type: int):
-            if task_type == 0:
-                return ["L_0", "L_2", "L_6", "L_10"]
-            elif task_type == 1:
-                return ["L_0", "L_1", "L_3", "L_7"]
-            elif task_type == 2:
-                return ["L_0", "L_1", "L_4", "L_8"]
-            elif task_type == 3:
-                return ["L_0", "L_2", "L_5", "L_9"]
-            elif task_type == 4:
-                return ["L_0", "L_2", "L_6", "L_11"]
+        x_lora = x  # We'll transform this through each sub-key in sequence
+        for i,sub_key in enumerate(active_adapter_hlora):
+            # LoRA modules
+            lora_A = self.lora_A[sub_key]
+            lora_B = self.lora_B[sub_key]
+            # proj   = self.proj[sub_key]         # after B, we have a proj back to in_features
+            dropout = self.lora_dropout[sub_key]
+
+            # Possibly sub_key-specific scaling
+            # (below uses the first adapter in self.active_adapters, as an example)
+            scale = self.scaling[self.active_adapters[0]]
+
+            # Convert x_lora to the LoRA weight's dtype
+            # (common in mixed-precision training)
+            sub_in = x_lora.to(lora_A.weight.dtype)
+
+            # 1) Apply dropout
+            sub_in = dropout(sub_in)
+            # 2) A -> B -> proj chain
+            sub_in = lora_A(sub_in)
+            if i < len(active_adapter_hlora)-1:
+                proj   = self.proj[sub_key]  
+                sub_in = base_out + lora_B(sub_in) * scale
+                sub_in = proj(sub_in)
             else:
-                raise ValueError(f"Unknown task_type = {task_type}")
+                sub_in = lora_B(sub_in) * scale
+
+
+            # 4) The output of this sub-key is the input to the next
+            x_lora = sub_in
 
         # ------------------------------------------------------------------------
-        # 2) For each item in the batch, apply the sub-layers that correspond
-        #    to its task_type, then add it to that item's base_out
+        # 6) Add the final LoRA output to the base_out
         # ------------------------------------------------------------------------
-        all_sub_keys = list(self.lora_A.keys())
-        batch_size = x.shape[0]
+        final_out = base_out + x_lora
+        final_out = final_out.to(orig_dtype)
 
-        for i in range(batch_size):
-            task_type_i = int(task_types[i].item())  # e.g. 0,1,2,3,4,...
-            # Which sub-layers do we activate for THIS sample?
-            active_adapter_hlora = get_active_adapter_hlora(task_type_i)
+        return final_out
 
-            # Start with the original input for the LoRA passes
-            # (not the base_out, since you want to replicate the "chained_lora = x" logic)
-            chained_lora = x[i : i + 1, :]  # shape [1, seq_len, hidden], for example
 
-            # For each adapter in self.active_adapters (if you only ever have one,
-            # you can simplify the loop)
-            for active_adapter in self.active_adapters:
-                scaling_val = self.scaling[active_adapter]
 
-                # Loop over all sub-keys (L_0..L_11), but only apply those in `active_adapter_hlora`
-                for sub_key in all_sub_keys:
-                    if sub_key not in active_adapter_hlora:
-                        continue
-
-                    lora_A = self.lora_A[sub_key]
-                    lora_B = self.lora_B[sub_key]
-                    dropout = self.lora_dropout[sub_key]
-
-                    # Apply the transforms in series
-                    chained_lora = chained_lora.to(lora_A.weight.dtype)
-                    chained_lora = lora_B(lora_A(dropout(chained_lora))) * scaling_val
-
-            # Add the LoRA output to that particular row in the final result
-            result[i : i + 1, :] += chained_lora
-
-        # Convert back to the original dtype if needed
-        result = result.to(torch_result_dtype)
-        return result
 
     def __repr__(self) -> str:
         rep = super().__repr__()

@@ -4311,12 +4311,12 @@ class Trainer:
         if isinstance(all_losses, list) and all_losses:
             concatenated_losses = np.array(all_losses)
             metrics[f"{metric_key_prefix}_loss"] = concatenated_losses.mean().item()
-            print(" Sum: ",concatenated_losses.sum().item(), "\n")
-            print(" Count: ",len(concatenated_losses), "\n")
+            # print(" Sum: ",concatenated_losses.sum().item(), "\n")
+            # print(" Count: ",len(concatenated_losses), "\n")
         elif isinstance(all_losses, np.ndarray):
             metrics[f"{metric_key_prefix}_loss"] = all_losses.mean().item()
-            print(" Sum: ",all_losses.sum().item(), "\n")
-            print(" Count: ",len(all_losses), "\n")
+            # print(" Sum: ",all_losses.sum().item(), "\n")
+            # print(" Count: ",len(all_losses), "\n")
         if hasattr(self, "jit_compilation_time"):
             metrics[f"{metric_key_prefix}_jit_compilation_time"] = self.jit_compilation_time
         if hasattr(self, "model_preparation_time"):

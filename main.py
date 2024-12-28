@@ -168,21 +168,21 @@ print("Preprocessing training data...")
 sampled_train = sample_by_group_with_max(
         dataset["train"],
         group_col="dataset_name",
-        fraction=0.01,       # e.g. 1% of the largest group
+        fraction=0.00001,       # e.g. 1% of the largest group
         random_state=42,
         oversample=False     # or True if you want to oversample smaller groups
     )
 train_dataset = prepare_dataset(sampled_train, "train")
 
 print("Preprocessing validation data...")
-# sampled_eval = sample_by_group_with_max(
-#         dataset["validation"],
-#         group_col="dataset_name",
-#         fraction=0.01,       # e.g. 1% of the largest group
-#         random_state=42,
-#         oversample=False     # or True if you want to oversample smaller groups
-#     )
-eval_dataset = prepare_dataset(dataset["validation"], "validation")
+sampled_eval = sample_by_group_with_max(
+        dataset["validation"],
+        group_col="dataset_name",
+        fraction=0.0001,       # e.g. 1% of the largest group
+        random_state=42,
+        oversample=False     # or True if you want to oversample smaller groups
+    )
+eval_dataset = prepare_dataset(sampled_eval, "validation")
 
 # 4. Apply PEFT with LoRA configurations
 # Define LoRA configurations
@@ -214,7 +214,7 @@ with open('trainable_parameters.txt', 'w') as f:
 
 # 5. Define training arguments
 batch_size: int = 1
-num_train_epochs = 1
+num_train_epochs = 10
 steps_per_epoch = len(train_dataset) // batch_size
 total_steps = int(steps_per_epoch * num_train_epochs)
 
@@ -238,7 +238,7 @@ training_args = TrainingArguments(
     save_strategy="no",
     report_to="none",
     seed=seed,  # Set seed for TrainingArguments
-    evaluation_strategy="no",
+    evaluation_strategy="epoch",
     dataloader_num_workers=8,
     # torch_compile=True,
     dataloader_persistent_workers=True,
